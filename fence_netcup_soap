@@ -1,0 +1,163 @@
+#!/usr/bin/python -tt
+
+import sys
+import shutil, tempfile, suds, zeep
+import logging, requests
+import atexit
+sys.path.append("/usr/share/fence")
+
+from zeep.transports import Transport
+from suds.client import Client
+from suds.sudsobject import Property
+from suds.transport.http import HttpAuthenticated
+from suds.transport import Reply, TransportError
+from fencing import *
+from fencing import fail, fail_usage, EC_STATUS, EC_LOGIN_DENIED, EC_INVALID_PRIVILEGES, EC_WAITING_ON, EC_WAITING_OFF
+from fencing import run_delay
+
+#BEGIN_VERSION_GENERATION
+RELEASE_VERSION="0.0.1"
+BUILD_DATE="(built Thu, 31 May 2018 15:01:48 +0100)"
+REDHAT_COPYRIGHT="Copyright (C) under MIT License"
+#END_VERSION_GENERATION
+
+options_global = None
+conn_global = None
+
+#class RequestsTransport(HttpAuthenticated):
+#	def __init__(self, **kwargs):
+#		self.cert = kwargs.pop('cert', None)
+#		self.verify = kwargs.pop('verify', True)
+#		self.session = requests.Session()
+#		# super won't work because not using new style class
+#		HttpAuthenticated.__init__(self, **kwargs)
+#
+#	def send(self, request):
+#		self.addcredentials(request)
+#		resp = self.session.post(request.url, data=request.message, headers=request.headers, cert=self.cert, verify=self.verify)
+#		result = Reply(resp.status_code, resp.headers, resp.content)
+#		return result
+
+def soap_login(options):
+	run_delay(options)
+
+	if "--ssl" in options or "--ssl-secure" in options or "--ssl-insecure" in options:
+		if "--ssl-insecure" in options:
+			from requests.packages.urllib3.exceptions import InsecureRequestWarning
+			requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+			verify = False
+		else:
+			verify = True
+		url = "https://"
+	else:
+		verify = False
+		url = "http://"
+
+	url += options["--ip"] + ":" + str(options["--ipport"]) + "/WSEndUser?wsdl"
+
+	tmp_dir = tempfile.mkdtemp()
+	tempfile.tempdir = tmp_dir
+	atexit.register(remove_tmp_dir, tmp_dir)
+
+	try:
+		conn = zeep.Client(wsdl=url)
+
+		conn.service.getVServers(options["--username"], options["--password"])
+	except requests.exceptions.SSLError as ex:
+		fail_usage("Server side certificate verification failed")
+	except Exception:
+		fail(EC_LOGIN_DENIED)
+
+	return conn
+
+def process_results(results, machines, uuid, mappingToUUID):
+	for m in results.objects:
+		info = {}
+		for i in m.propSet:
+			info[i.name] = i.val
+		# Prevent error KeyError: 'config.uuid' when reaching systems which P2V failed,
+		# since these systems don't have a valid UUID
+		if "config.uuid" in info:
+			machines[info["name"]] = (info["config.uuid"], info["summary.runtime.powerState"])
+			uuid[info["config.uuid"]] = info["summary.runtime.powerState"]
+			mappingToUUID[m.obj.value] = info["config.uuid"]
+
+	return (machines, uuid, mappingToUUID)
+
+def get_power_status(conn, options):
+	try:
+		machines = conn.service.getVServers(options["--username"], options["--password"])
+		#print machines
+	except Exception:
+		fail(EC_STATUS)
+
+	if ["list", "monitor"].count(options["--action"]) == 1:
+		return machines
+	else:
+		try:
+			status = conn.service.getVServerState(options["--username"], options["--password"], options["--plug"])
+			#print status
+		except Exception:
+			fail(EC_STATUS)
+
+		if status == "online":
+			return "on"
+		else:
+			return "off"
+
+def set_power_status(conn, options):
+	try:
+		if options["--action"] == "on":
+			conn.service.startVServer(options["--username"], options["--password"], options["--plug"])
+		else:
+			conn.service.stopVServer(options["--username"], options["--password"], options["--plug"])
+	except Exception:
+		fail(EC_INVALID_PRIVILEGES)
+		#fail(EC_STATUS)
+
+	if options["--action"] == "on":
+		fail(EC_WAITING_ON)
+	else:
+		fail(EC_WAITING_OFF)
+
+def remove_tmp_dir(tmp_dir):
+	shutil.rmtree(tmp_dir)
+
+def main():
+	global options_global
+	global conn_global
+	device_opt = ["ipaddr", "login", "passwd", "web", "ssl", "notls", "port"]
+
+	atexit.register(atexit_handler)
+
+	options_global = check_input(device_opt, process_input(device_opt))
+
+	##
+	## Fence agent specific defaults
+	#####
+	docs = {}
+	docs["shortdesc"] = "Fence agent for VMWare over SOAP API"
+	docs["longdesc"] = "fence_netcup_soap is an I/O Fencing agent \
+which can be used with the virtual machines managed by netcup soap API \
+that have SOAP API v4.1+.\n \
+Originaly modified from fence_vmware_soap."
+	docs["vendorurl"] = "http://www.amssn.eu/"
+	show_docs(options_global, docs)
+
+	logging.basicConfig(level=logging.INFO)
+	logging.getLogger('suds.client').setLevel(logging.CRITICAL)
+	logging.getLogger("requests").setLevel(logging.CRITICAL)
+	logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+
+	##
+	## Operate the fencing device
+	####
+
+	conn_global = soap_login(options_global)
+	result = fence_action(conn_global, options_global, set_power_status, get_power_status)
+
+	## Logout from system is done automatically via atexit()
+	sys.exit(result)
+
+if __name__ == "__main__":
+	main()
