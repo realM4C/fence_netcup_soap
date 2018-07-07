@@ -4,6 +4,8 @@ import sys
 import shutil, tempfile, suds, zeep
 import logging, requests
 import atexit
+import datetime
+
 sys.path.append("/usr/share/fence")
 
 from zeep.transports import Transport
@@ -23,22 +25,13 @@ REDHAT_COPYRIGHT="Copyright (C) under MIT License"
 
 options_global = None
 conn_global = None
-
-#class RequestsTransport(HttpAuthenticated):
-#	def __init__(self, **kwargs):
-#		self.cert = kwargs.pop('cert', None)
-#		self.verify = kwargs.pop('verify', True)
-#		self.session = requests.Session()
-#		# super won't work because not using new style class
-#		HttpAuthenticated.__init__(self, **kwargs)
-#
-#	def send(self, request):
-#		self.addcredentials(request)
-#		resp = self.session.post(request.url, data=request.message, headers=request.headers, cert=self.cert, verify=self.verify)
-#		result = Reply(resp.status_code, resp.headers, resp.content)
-#		return result
+servers_global = None
+status_global = {}
+debug_log = open('/var/log/cluster/fence_netcup_soap.log', 'a')
 
 def soap_login(options):
+	global debug_log
+	print >> debug_log, "SOAP_LOGIN: In Function"
 	run_delay(options)
 
 	if "--ssl" in options or "--ssl-secure" in options or "--ssl-insecure" in options:
@@ -55,70 +48,118 @@ def soap_login(options):
 
 	url += options["--ip"] + ":" + str(options["--ipport"]) + "/WSEndUser?wsdl"
 
+	print >> debug_log, "URL: ", url
+
 	tmp_dir = tempfile.mkdtemp()
 	tempfile.tempdir = tmp_dir
 	atexit.register(remove_tmp_dir, tmp_dir)
 
 	try:
 		conn = zeep.Client(wsdl=url)
-
-		conn.service.getVServers(options["--username"], options["--password"])
+		servers_global = conn.service.getVServers(options["--username"], options["--password"])
+		print >> debug_log, "LOGIN: ", servers_global
 	except requests.exceptions.SSLError as ex:
+		print >> debug_log, "LOGIN: ", "Server side certificate verification failed"
 		fail_usage("Server side certificate verification failed")
 	except Exception:
+		print >> debug_log, "LOGIN: ", "Login DENIED"
 		fail(EC_LOGIN_DENIED)
 
 	return conn
 
-def process_results(results, machines, uuid, mappingToUUID):
-	for m in results.objects:
-		info = {}
-		for i in m.propSet:
-			info[i.name] = i.val
-		# Prevent error KeyError: 'config.uuid' when reaching systems which P2V failed,
-		# since these systems don't have a valid UUID
-		if "config.uuid" in info:
-			machines[info["name"]] = (info["config.uuid"], info["summary.runtime.powerState"])
-			uuid[info["config.uuid"]] = info["summary.runtime.powerState"]
-			mappingToUUID[m.obj.value] = info["config.uuid"]
-
-	return (machines, uuid, mappingToUUID)
-
 def get_power_status(conn, options):
-	try:
-		machines = conn.service.getVServers(options["--username"], options["--password"])
-		#print machines
-	except Exception:
-		fail(EC_STATUS)
+	global servers_global
+	global status_global
+	global debug_log
 
-	if ["list", "monitor"].count(options["--action"]) == 1:
-		return machines
-	else:
+	print >> debug_log, "GET_POWER_STATUS: In Function"
+
+	if options["--action"] == "status":
 		try:
 			status = conn.service.getVServerState(options["--username"], options["--password"], options["--plug"])
-			#print status
+			print >> debug_log, "GET_POWER_STATUS: ", status
 		except Exception:
+			print >> debug_log, "GET_POWER_STATUS: ", EC_STATUS
 			fail(EC_STATUS)
 
 		if status == "online":
+			print >> debug_log, "GET_POWER_STATUS: ", "Server is powerd on"
 			return "on"
 		else:
+			print >> debug_log, "GET_POWER_STATUS: ", "Server is powerd off"
 			return "off"
 
 def set_power_status(conn, options):
+	global debug_log
+	print >> debug_log, "SET_POWER_STATUS: In Function"
+	fail(EC_INVALID_PRIVILEGES)
+	return
+	# TODO: make restart action
+
 	try:
+		log = None
 		if options["--action"] == "on":
-			conn.service.startVServer(options["--username"], options["--password"], options["--plug"])
+			log = conn.service.startVServer(options["--username"], options["--password"], options["--plug"])
 		else:
-			conn.service.stopVServer(options["--username"], options["--password"], options["--plug"])
+			log = conn.service.stopVServer(options["--username"], options["--password"], options["--plug"])
+
+		print >> debug_log, "SET_POWER_STATUS: ", log
 	except Exception:
+		print >> debug_log, "SET_POWER_STATUS: ", EC_INVALID_PRIVILEGES
 		fail(EC_INVALID_PRIVILEGES)
 		#fail(EC_STATUS)
 
 	if options["--action"] == "on":
+		print >> debug_log, "SET_POWER_STATUS: ", EC_WAITING_ON
 		fail(EC_WAITING_ON)
 	else:
+		print >> debug_log, "SET_POWER_STATUS: ", EC_WAITING_OFF
 		fail(EC_WAITING_OFF)
+
+	return
+
+def get_list(conn, options):
+	global servers_global
+	global status_global
+	global debug_log
+
+	if servers_global == None:
+		try:
+			servers_global = conn.service.getVServers(options["--username"], options["--password"])
+		except Exception:
+			print >> debug_log, "GET_LIST: ", EC_STATUS
+			fail(EC_STATUS)
+
+	for m in servers_global:
+		status = conn.service.getVServerState(options["--username"], options["--password"], m)
+		status_global[m] = status
+		try:
+			status = conn.service.getVServerState(options["--username"], options["--password"], m)
+			if status == "online":
+				status_global[m] = (m, "on")
+			else:
+				status_global[m] = (m, "off")
+
+			print >> debug_log, "GET_LIST: ", "Plug: ", m, " Status ", status_global[m]
+
+		except Exception:
+			print >> debug_log, "GET_LIST: Ex ", EC_INVALID_PRIVILEGES
+			fail(EC_INVALID_PRIVILEGES)
+
+	print >> debug_log, "GET_LIST: In Function"
+	fail(EC_INVALID_PRIVILEGES)
+
+	#print status_global
+	print >> debug_log, "GET_LIST: Overview ", status_global
+	# TODO: Normalize return values
+	if ["list"].count(options["--action"]) == 1:
+		return status_global
+
+#	if ["monitor"].count(options["--action"]) == 1:
+#		return status_global[options["--plug"]]
+
+#	return { }
+
 
 def remove_tmp_dir(tmp_dir):
 	shutil.rmtree(tmp_dir)
@@ -126,6 +167,10 @@ def remove_tmp_dir(tmp_dir):
 def main():
 	global options_global
 	global conn_global
+	global debug_log
+
+	print >> debug_log, datetime.datetime.now()
+
 	device_opt = ["ipaddr", "login", "passwd", "web", "ssl", "notls", "port"]
 
 	atexit.register(atexit_handler)
@@ -136,25 +181,27 @@ def main():
 	## Fence agent specific defaults
 	#####
 	docs = {}
-	docs["shortdesc"] = "Fence agent for VMWare over SOAP API"
+	docs["shortdesc"] = "Fence agent for NETCUP over SOAP API"
 	docs["longdesc"] = "fence_netcup_soap is an I/O Fencing agent \
 which can be used with the virtual machines managed by netcup soap API \
-that have SOAP API v4.1+.\n \
-Originaly modified from fence_vmware_soap."
-	docs["vendorurl"] = "http://www.amssn.eu/"
+that have SOAP API v4.1+."
+	docs["vendorurl"] = "http://git.amssn.eu/fence_netcup_soap"
 	show_docs(options_global, docs)
-
-	logging.basicConfig(level=logging.INFO)
-	logging.getLogger('suds.client').setLevel(logging.CRITICAL)
-	logging.getLogger("requests").setLevel(logging.CRITICAL)
-	logging.getLogger("urllib3").setLevel(logging.CRITICAL)
 
 	##
 	## Operate the fencing device
 	####
 
+	print >> debug_log, "ACTION: ", options_global["--action"]
+	print >> debug_log, "OPTIONS: ", options_global
+
 	conn_global = soap_login(options_global)
-	result = fence_action(conn_global, options_global, set_power_status, get_power_status)
+	## Do the delay of the fence device before logging in
+	## Delay is important for two-node clusters fencing but we do not need to delay 'status' operations
+	if options_global["--action"] in ["off", "on", "reboot"]:
+		time.sleep(int(options["--delay"]))
+
+	result = fence_action(conn_global, options_global, set_power_status, get_power_status, get_list)
 
 	## Logout from system is done automatically via atexit()
 	sys.exit(result)
