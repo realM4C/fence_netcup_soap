@@ -1,14 +1,10 @@
-#!/usr/bin/python -tt
-
+#!/usr/bin/python3 -tt
 import sys
-import shutil, tempfile, suds, zeep
+import shutil, tempfile, suds
 import logging, requests
-import atexit
-import datetime
-
+import atexit, signal
 sys.path.append("/usr/share/fence")
 
-from zeep.transports import Transport
 from suds.client import Client
 from suds.sudsobject import Property
 from suds.transport.http import HttpAuthenticated
@@ -28,6 +24,28 @@ conn_global = None
 servers_global = None
 status_global = {}
 debug_log = open('/var/log/cluster/fence_netcup_soap.log', 'a')
+
+class RequestsTransport(HttpAuthenticated):
+	def __init__(self, **kwargs):
+		self.cert = kwargs.pop('cert', None)
+		self.verify = kwargs.pop('verify', True)
+		self.session = requests.Session()
+		# super won't work because not using new style class
+		HttpAuthenticated.__init__(self, **kwargs)
+
+	def send(self, request):
+		self.addcredentials(request)
+		resp = self.session.post(request.url, data=request.message, headers=request.headers, cert=self.cert, verify=self.verify)
+		result = Reply(resp.status_code, resp.headers, resp.content)
+		return result
+
+
+
+
+
+
+
+
 
 def soap_login(options):
 	global debug_log
@@ -168,12 +186,13 @@ def main():
 	global options_global
 	global conn_global
 	global debug_log
-
 	print >> debug_log, datetime.datetime.now()
-
 	device_opt = ["ipaddr", "login", "passwd", "web", "ssl", "notls", "port"]
 
 	atexit.register(atexit_handler)
+	atexit.register(logout)
+
+	signal.signal(signal.SIGTERM, signal_handler)
 
 	options_global = check_input(device_opt, process_input(device_opt))
 
@@ -188,23 +207,26 @@ that have SOAP API v4.1+."
 	docs["vendorurl"] = "http://git.amssn.eu/fence_netcup_soap"
 	show_docs(options_global, docs)
 
+	logging.basicConfig(level=logging.INFO)
+	logging.getLogger('suds.client').setLevel(logging.CRITICAL)
+	logging.getLogger("requests").setLevel(logging.CRITICAL)
+	logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+
 	##
 	## Operate the fencing device
 	####
-
 	print >> debug_log, "ACTION: ", options_global["--action"]
 	print >> debug_log, "OPTIONS: ", options_global
-
 	conn_global = soap_login(options_global)
-	## Do the delay of the fence device before logging in
-	## Delay is important for two-node clusters fencing but we do not need to delay 'status' operations
-	if options_global["--action"] in ["off", "on", "reboot"]:
-		time.sleep(int(options["--delay"]))
 
-	result = fence_action(conn_global, options_global, set_power_status, get_power_status, get_list)
+	result = fence_action(conn_global, options_global, set_power_status, get_power_status, get_power_status)
 
 	## Logout from system is done automatically via atexit()
 	sys.exit(result)
+
+
+
+def main():
 
 if __name__ == "__main__":
 	main()
